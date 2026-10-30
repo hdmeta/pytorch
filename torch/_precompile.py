@@ -3563,6 +3563,23 @@ def _read_artifact(
     return python_code, cache
 
 
+def _matching_cache(
+    python_code: str, cache_path: str | os.PathLike[str]
+) -> bytes | None:
+    """The cache at ``cache_path`` if it was captured with exactly ``python_code``:
+    None for a missing or unreadable cache, and for an artifact edited after capture
+    (the cache's code_hash covers the captured text)."""
+    try:
+        with open(cache_path, "rb") as f:
+            cache = f.read()
+        blob = torch.load(io.BytesIO(cache), weights_only=True)
+    except Exception:
+        return None
+    if blob.get("code_hash") != hashlib.sha256(python_code.encode()).hexdigest():
+        return None
+    return cache
+
+
 def _verified_cache_envelope(
     cache: bytes,
     *,
