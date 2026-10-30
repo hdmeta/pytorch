@@ -23,6 +23,7 @@
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/cuda/Sleep.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
+#include <c10/util/env.h>
 #include <rocblas/rocblas.h>
 
 #include <array>
@@ -732,10 +733,92 @@ TEST(CUDABlasHandlePoolTest, PublicHandleFromExitedThreadWaitsForItsStream) {
       [] { return at::cuda::getCurrentCUDABlasHandle(); });
 }
 
+// With the check in fence mode, which main() turns on, a launch on a stream
+// other than the one the handle last used waits for that stream's queued work.
+TEST(CUDABlasHandlePoolTest, LtHandleStreamCheckOrdersCrossStreamLaunch) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  at::cuda::CUDAGuard device_guard(0);
+  // The check never dereferences the handle, so any distinct pointer works.
+  int key = 0;
+  const auto handle = reinterpret_cast<cublasLtHandle_t>(&key);
+  const auto first = c10::cuda::getStreamFromPool();
+  const auto second = c10::cuda::getStreamFromPool();
+  at::cuda::checkCublasLtHandleStream(handle, first);
+  at::cuda::CUDAEvent first_done;
+  {
+    c10::cuda::CUDAStreamGuard stream_guard(first);
+    at::cuda::sleep(200'000'000);
+    first_done.record(first);
+  }
+
+  at::cuda::checkCublasLtHandleStream(handle, second);
+  at::cuda::CUDAEvent after_launch;
+  after_launch.record(second);
+
+  // The launch finishes only after the work queued before it.
+  after_launch.synchronize();
+  EXPECT_TRUE(first_done.query());
+}
+
+// The same when the handle last ran on another device: from a pool stream to
+// the other device's default stream, then between the two devices' default
+// streams, which are both the null stream.
+TEST(CUDABlasHandlePoolTest, LtHandleStreamCheckOrdersCrossDeviceLaunch) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  if (at::cuda::device_count() < 2) {
+    GTEST_SKIP() << "requires two GPUs";
+  }
+  int key = 0;
+  const auto handle = reinterpret_cast<cublasLtHandle_t>(&key);
+  const auto pool_stream =
+      c10::cuda::getStreamFromPool(/*isHighPriority=*/false, 0);
+  const auto default0 = c10::cuda::getDefaultCUDAStream(0);
+  const auto default1 = c10::cuda::getDefaultCUDAStream(1);
+  // A stream's first launch can take longer than the sleeps below, so the
+  // default streams launch here first.
+  for (const auto& stream : {default0, default1}) {
+    at::cuda::CUDAEvent ready;
+    ready.record(stream);
+    ready.synchronize();
+  }
+  const auto expect_ordered = [&](c10::cuda::CUDAStream last,
+                                  c10::cuda::CUDAStream next) {
+    at::cuda::CUDAEvent last_done;
+    {
+      c10::cuda::CUDAStreamGuard stream_guard(last);
+      at::cuda::sleep(200'000'000);
+      last_done.record(last);
+    }
+    at::cuda::CUDAGuard device_guard(next.device_index());
+    at::cuda::checkCublasLtHandleStream(handle, next);
+    at::cuda::CUDAEvent after_launch;
+    after_launch.record(next);
+    after_launch.synchronize();
+    EXPECT_TRUE(last_done.query())
+        << "launch on device " << static_cast<int>(next.device_index());
+  };
+  {
+    at::cuda::CUDAGuard device_guard(0);
+    at::cuda::checkCublasLtHandleStream(handle, pool_stream);
+  }
+
+  expect_ordered(pool_stream, default1);
+  expect_ordered(default1, default0);
+}
+
 #endif // USE_ROCM
 
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
+#ifdef USE_ROCM
+  // The hipBLASLt stream check reads its mode once, at the first launch, so
+  // fence mode for its tests is set before any test runs.
+  c10::utils::set_env("TORCH_HIPBLASLT_CHECK_HANDLE_STREAMS", "fence");
+#endif
   // Every TEST() below already guards on at::cuda::is_available() and returns
   // early when there's no GPU. init() below is not: it unconditionally touches
   // the CUDA driver (DeviceCachingAllocator's ctor calls cudaGetDeviceProperties),
