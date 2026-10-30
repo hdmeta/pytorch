@@ -32,6 +32,7 @@
 #include <torch/csrc/distributed/c10d/TraceUtils.h>
 #include <torch/csrc/distributed/c10d/Utils.hpp>
 #include <torch/csrc/distributed/c10d/cuda/utils.hpp>
+#include <torch/csrc/distributed/c10d/nccl2/CommDump.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_manager.hpp>
 #include <torch/torch.h>
 #include <optional>
@@ -418,6 +419,7 @@ static std::
   for (auto& ncclComm : allNCCLComms) {
     ncclDumpMap[ncclComm->getUniqueHash()] = ncclComm->ncclCommDump();
   }
+  ncclDumpMap.merge(nccl2::dumpNcclComms());
   return ncclDumpMap;
 #else
   return std::unordered_map<
